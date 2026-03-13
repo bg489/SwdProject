@@ -1,4 +1,18 @@
 import crypto from "crypto";
+import { sendOtpEmail } from "../services/emailService.js";
+
+export const OTP_PURPOSES = {
+  LOGIN: "LOGIN",
+  PASSWORD_RESET: "PASSWORD_RESET",
+};
+
+export const isSupportedOtpChannel = (channel) => {
+  return ["email", "sms"].includes((channel || "").toLowerCase());
+};
+
+export const buildOtpChannelKey = ({ purpose, channel }) => {
+  return `${purpose}_${channel.toUpperCase()}`;
+};
 
 export const generateOtpCode = () => {
   return Math.floor(100000 + Math.random() * 900000).toString();
@@ -25,32 +39,67 @@ export const canResendOtp = (latestOtp) => {
   return now - createdAt >= cooldownSeconds * 1000;
 };
 
-export const maskEmail = (email) => {
-  if (!email || !email.includes("@")) return email;
-  const [name, domain] = email.split("@");
-  if (name.length <= 2) return `${name[0]}***@${domain}`;
-  return `${name.slice(0, 2)}***@${domain}`;
+export const getOtpDestination = (user, channel) => {
+  return channel === "email" ? user.email : user.phone;
 };
 
-export const maskPhone = (phone) => {
+export const getMaskedOtpDestination = (user, channel) => {
+  if (channel === "email") {
+    const email = user.email;
+    if (!email || !email.includes("@")) return email;
+
+    const [name, domain] = email.split("@");
+    if (name.length <= 2) return `${name[0]}***@${domain}`;
+    return `${name.slice(0, 2)}***@${domain}`;
+  }
+
+  const phone = user.phone;
   if (!phone || phone.length < 4) return phone;
   return `${"*".repeat(phone.length - 4)}${phone.slice(-4)}`;
 };
 
-/**
- * Stub gửi OTP.
- * Hiện tại chưa tích hợp SMS/Email provider thật.
- * Dev mode: trả debug_otp để test.
- * Prod: chỉ log, không trả OTP ra client.
- */
-export const sendOtpOutOfBand = async ({ channel, destination, code }) => {
-  console.log(`[OTP][${channel}] send to ${destination}: ${code}`);
+export const sendOtpOutOfBand = async ({
+  channel,
+  destination,
+  code,
+  purpose = OTP_PURPOSES.LOGIN,
+}) => {
+  if (channel === "email") {
+    const mailEnabled =
+      String(process.env.MAIL_ENABLED).toLowerCase() === "true";
 
-  if (process.env.NODE_ENV !== "production") {
-    return {
-      debug_otp: code,
-    };
+    if (mailEnabled) {
+      await sendOtpEmail({
+        to: destination,
+        otpCode: code,
+        purpose,
+      });
+
+      return {
+        delivery: "email",
+      };
+    }
+
+    console.log(`[DEV OTP EMAIL] to=${destination} code=${code}`);
+
+    return process.env.NODE_ENV !== "production"
+      ? {
+          delivery: "debug",
+          debug_otp: code,
+        }
+      : {
+          delivery: "disabled",
+        };
   }
 
-  return {};
+  console.log(`[DEV OTP SMS] to=${destination} code=${code}`);
+
+  return process.env.NODE_ENV !== "production"
+    ? {
+        delivery: "debug",
+        debug_otp: code,
+      }
+    : {
+        delivery: "disabled",
+      };
 };
