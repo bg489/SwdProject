@@ -1,3 +1,15 @@
+import {
+  generateOtpCode,
+  hashOtpCode,
+  getOtpExpiryDate,
+  canResendOtp,
+  sendOtpOutOfBand,
+  isSupportedOtpChannel,
+  buildOtpChannelKey,
+  getOtpDestination,
+  getMaskedOtpDestination,
+  OTP_PURPOSES,
+} from "../utils/otpUtils.js";
 import bcrypt from "bcryptjs";
 import { Op } from "sequelize";
 import {
@@ -5,6 +17,7 @@ import {
   Role,
   Permission,
   SessionToken,
+  OtpVerification,
 } from "../models/index.js";
 import { buildAuthClaims } from "../utils/authClaims.js";
 import {
@@ -46,9 +59,98 @@ const loadUserWithRoleAndPermissions = async (whereClause) => {
   });
 };
 
+const issueLoginSession = async (req, user) => {
+  const claims = buildAuthClaims(user);
+  const refreshToken = generateOpaqueRefreshToken();
+  const refreshTokenHash = hashToken(refreshToken);
+  const now = new Date();
+
+  const session = await SessionToken.create({
+    user_id: user.user_id,
+    token_hash: refreshTokenHash,
+    issued_at: now,
+    expires_at: getRefreshExpiryDate(),
+    revoked_at: null,
+    device_info: req.headers["user-agent"] || null,
+    ip_address: getClientIp(req),
+  });
+
+  const accessToken = createAccessToken({
+    user,
+    claims,
+    sessionId: session.session_id,
+  });
+
+  await user.update({
+    last_login_at: now,
+  });
+
+  return {
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    token_type: "Bearer",
+    claims,
+    session: {
+      session_id: session.session_id,
+      issued_at: session.issued_at,
+      expires_at: session.expires_at,
+    },
+    user: {
+      user_id: user.user_id,
+      email: user.email,
+      phone: user.phone,
+      role_id: user.role_id,
+      role_name: user.Role.role_name,
+      account_status: user.account_status,
+      otp_enabled: user.otp_enabled,
+      last_login_at: now,
+    },
+  };
+};
+
+const expireOldPendingOtps = async (
+  userId,
+  otpChannelKey,
+  replacementStatus = "REPLACED"
+) => {
+  const now = new Date();
+
+  // 1) OTP hết hạn -> EXPIRED
+  await OtpVerification.update(
+    { status: "EXPIRED" },
+    {
+      where: {
+        user_id: userId,
+        channel: otpChannelKey,
+        consumed_at: null,
+        status: "PENDING",
+        expires_at: {
+          [Op.lt]: now,
+        },
+      },
+    }
+  );
+
+  // 2) OTP còn pending -> REPLACED
+  await OtpVerification.update(
+    { status: replacementStatus },
+    {
+      where: {
+        user_id: userId,
+        channel: otpChannelKey,
+        consumed_at: null,
+        status: "PENDING",
+      },
+    }
+  );
+};
+
+
+
 export const login = async (req, res, next) => {
   try {
     const { identifier, password } = req.body;
+    const channel = (req.body.channel || "email").toLowerCase();
 
     const user = await loadUserWithRoleAndPermissions({
       [Op.or]: [{ email: identifier }, { phone: identifier }],
@@ -80,51 +182,181 @@ export const login = async (req, res, next) => {
       });
     }
 
-    const claims = buildAuthClaims(user);
-    const refreshToken = generateOpaqueRefreshToken();
-    const refreshTokenHash = hashToken(refreshToken);
-    const now = new Date();
+    if (!user.otp_enabled) {
+      const loginResult = await issueLoginSession(req, user);
 
-    const session = await SessionToken.create({
-      user_id: user.user_id,
-      token_hash: refreshTokenHash,
-      issued_at: now,
-      expires_at: getRefreshExpiryDate(),
-      revoked_at: null,
-      device_info: req.headers["user-agent"] || null,
-      ip_address: getClientIp(req),
+      return res.status(200).json({
+        message: "Login successful",
+        ...loginResult,
+      });
+    }
+
+    if (!isSupportedOtpChannel(channel)) {
+      return res.status(400).json({
+        message: "Channel must be email or sms",
+      });
+    }
+
+    const otpChannelKey = buildOtpChannelKey({
+      purpose: OTP_PURPOSES.LOGIN,
+      channel,
     });
 
-    const accessToken = createAccessToken({
+    await expireOldPendingOtps(user.user_id, otpChannelKey);
+
+    const { otpRecord, sendResult, masked_destination } = await createAndSendPurposeOtp({
       user,
-      claims,
-      sessionId: session.session_id,
-    });
-
-    await user.update({
-      last_login_at: now,
+      purpose: OTP_PURPOSES.LOGIN,
+      channel,
     });
 
     return res.status(200).json({
-      message: "Login successful",
-      access_token: accessToken,
-      refresh_token: refreshToken,
-      token_type: "Bearer",
-      user: {
+      message: "OTP sent successfully",
+      requires_otp_verification: true,
+      otp_channel: channel,
+      otp_expires_at: otpRecord.expires_at,
+      sent_to: masked_destination,
+      identifier,
+      ...(sendResult.debug_otp ? { debug_otp: sendResult.debug_otp } : {}),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const verifyOtp = async (req, res, next) => {
+  try {
+    const { identifier, channel, otp_code } = req.body;
+
+    const user = await loadUserWithRoleAndPermissions({
+      [Op.or]: [{ email: identifier }, { phone: identifier }],
+    });
+
+    if (!user) {
+      return res.status(404).json({
+        message: "User not found",
+      });
+    }
+
+    if (user.account_status !== "ACTIVE") {
+      return res.status(403).json({
+        message: `Account is ${user.account_status}`,
+      });
+    }
+
+    if (!user.otp_enabled) {
+      return res.status(400).json({
+        message: "OTP is not enabled for this account",
+      });
+    }
+
+    const { otp: latestOtp } = await getLatestPendingOtpByPurpose({
+      userId: user.user_id,
+      purpose: OTP_PURPOSES.LOGIN,
+      channel,
+    });
+
+    if (!latestOtp) {
+      return res.status(404).json({
+        message: "No pending OTP found",
+      });
+    }
+
+    if (new Date(latestOtp.expires_at) < new Date()) {
+      await latestOtp.update({
+        status: "EXPIRED",
+      });
+
+      return res.status(410).json({
+        message: "OTP has expired",
+      });
+    }
+
+    const incomingHash = hashOtpCode(otp_code);
+
+    if (incomingHash !== latestOtp.code_hash) {
+      return res.status(401).json({
+        message: "Invalid OTP",
+      });
+    }
+
+    await latestOtp.update({
+      status: "VERIFIED",
+      consumed_at: new Date(),
+    });
+
+    const loginResult = await issueLoginSession(req, user);
+
+    return res.status(200).json({
+      message: "OTP verified successfully",
+      ...loginResult,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const resendOtp = async (req, res, next) => {
+  try {
+    const { identifier, channel } = req.body;
+
+    const user = await loadUserWithRoleAndPermissions({
+      [Op.or]: [{ email: identifier }, { phone: identifier }],
+    });
+
+    if (!user) {
+      return res.status(404).json({
+        message: "User not found",
+      });
+    }
+
+    if (user.account_status !== "ACTIVE") {
+      return res.status(403).json({
+        message: `Account is ${user.account_status}`,
+      });
+    }
+
+    if (!user.otp_enabled) {
+      return res.status(400).json({
+        message: "OTP is not enabled for this account",
+      });
+    }
+
+    const otpChannelKey = buildOtpChannelKey({
+      purpose: OTP_PURPOSES.LOGIN,
+      channel,
+    });
+
+    const latestAnyOtp = await OtpVerification.findOne({
+      where: {
         user_id: user.user_id,
-        email: user.email,
-        phone: user.phone,
-        role_id: user.role_id,
-        role_name: user.Role.role_name,
-        account_status: user.account_status,
-        last_login_at: now,
+        channel: otpChannelKey,
       },
-      claims,
-      session: {
-        session_id: session.session_id,
-        issued_at: session.issued_at,
-        expires_at: session.expires_at,
-      },
+      order: [["created_at", "DESC"]],
+    });
+
+    if (!canResendOtp(latestAnyOtp)) {
+      return res.status(429).json({
+        message: "Please wait before requesting another OTP",
+      });
+    }
+
+    await expireOldPendingOtps(user.user_id, otpChannelKey, "REPLACED");
+
+    const { otpRecord, sendResult, masked_destination } =
+      await createAndSendPurposeOtp({
+        user,
+        purpose: OTP_PURPOSES.LOGIN,
+        channel,
+      });
+
+    return res.status(200).json({
+      message: "OTP resent successfully",
+      otp_channel: channel,
+      otp_expires_at: otpRecord.expires_at,
+      sent_to: masked_destination,
+      identifier,
+      ...(sendResult.debug_otp ? { debug_otp: sendResult.debug_otp } : {}),
     });
   } catch (error) {
     next(error);
@@ -203,7 +435,6 @@ export const refreshAccessToken = async (req, res, next) => {
     }
 
     const claims = buildAuthClaims(user);
-
     const newRefreshToken = generateOpaqueRefreshToken();
     const newRefreshTokenHash = hashToken(newRefreshToken);
     const now = new Date();
@@ -248,6 +479,232 @@ export const logout = async (req, res, next) => {
 
     return res.status(200).json({
       message: "Logged out successfully",
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const loadUserByIdentifier = async (identifier) => {
+  return loadUserWithRoleAndPermissions({
+    [Op.or]: [{ email: identifier }, { phone: identifier }],
+  });
+};
+
+
+
+const createAndSendPurposeOtp = async ({ user, purpose, channel }) => {
+  const otpChannelKey = buildOtpChannelKey({ purpose, channel });
+  const destination = getOtpDestination(user, channel);
+  const otpCode = generateOtpCode();
+  const otpHash = hashOtpCode(otpCode);
+  const expiresAt = getOtpExpiryDate();
+  const createdAt = new Date();
+
+  const otpRecord = await OtpVerification.create({
+    user_id: user.user_id,
+    channel: otpChannelKey,
+    code_hash: otpHash,
+    expires_at: expiresAt,
+    consumed_at: null,
+    status: "PENDING",
+    created_at: createdAt,
+  });
+
+  const sendResult = await sendOtpOutOfBand({
+    channel,
+    destination,
+    code: otpCode,
+    purpose,
+  });
+
+  return {
+    otpRecord,
+    sendResult,
+    otpChannelKey,
+    masked_destination: getMaskedOtpDestination(user, channel),
+  };
+};
+
+const getLatestPendingOtpByPurpose = async ({ userId, purpose, channel }) => {
+  const otpChannelKey = buildOtpChannelKey({ purpose, channel });
+
+  const otp = await OtpVerification.findOne({
+    where: {
+      user_id: userId,
+      channel: otpChannelKey,
+      status: "PENDING",
+      consumed_at: null,
+    },
+    order: [["created_at", "DESC"]],
+  });
+
+  return {
+    otp,
+    otpChannelKey,
+  };
+};
+
+export const forgotPassword = async (req, res, next) => {
+  try {
+    const { identifier, channel } = req.body;
+
+    if (!isSupportedOtpChannel(channel)) {
+      return res.status(400).json({
+        message: "Channel must be email or sms",
+      });
+    }
+
+    const genericResponse = {
+      message: "If the account exists, a password reset OTP has been sent",
+    };
+
+    const user = await loadUserByIdentifier(identifier);
+
+    // Không lộ account tồn tại hay không
+    if (!user || user.account_status !== "ACTIVE") {
+      return res.status(200).json(genericResponse);
+    }
+
+    const otpChannelKey = buildOtpChannelKey({
+      purpose: OTP_PURPOSES.PASSWORD_RESET,
+      channel,
+    });
+
+    const latestAnyOtp = await OtpVerification.findOne({
+      where: {
+        user_id: user.user_id,
+        channel: otpChannelKey,
+      },
+      order: [["created_at", "DESC"]],
+    });
+
+    if (!canResendOtp(latestAnyOtp)) {
+      return res.status(429).json({
+        message: "Please wait before requesting another reset OTP",
+      });
+    }
+
+    await expireOldPendingOtps(user.user_id, otpChannelKey, "REPLACED");
+
+    const { otpRecord, sendResult, masked_destination } =
+      await createAndSendPurposeOtp({
+        user,
+        purpose: OTP_PURPOSES.PASSWORD_RESET,
+        channel,
+      });
+
+    return res.status(200).json({
+      ...genericResponse,
+      otp_channel: channel,
+      otp_expires_at: otpRecord.expires_at,
+      sent_to: masked_destination,
+      ...(sendResult.debug_otp ? { debug_otp: sendResult.debug_otp } : {}),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const resetPassword = async (req, res, next) => {
+  try {
+    const { identifier, channel, otp_code, new_password } = req.body;
+
+    if (!isSupportedOtpChannel(channel)) {
+      return res.status(400).json({
+        message: "Channel must be email or sms",
+      });
+    }
+
+    const user = await loadUserByIdentifier(identifier);
+
+    if (!user) {
+      return res.status(404).json({
+        message: "User not found",
+      });
+    }
+
+    if (user.account_status !== "ACTIVE") {
+      return res.status(403).json({
+        message: `Account is ${user.account_status}`,
+      });
+    }
+
+    const { otp: latestOtp, otpChannelKey } = await getLatestPendingOtpByPurpose({
+      userId: user.user_id,
+      purpose: OTP_PURPOSES.PASSWORD_RESET,
+      channel,
+    });
+
+    if (!latestOtp) {
+      return res.status(404).json({
+        message: "No pending reset OTP found",
+      });
+    }
+
+    if (new Date(latestOtp.expires_at) < new Date()) {
+      await latestOtp.update({
+        status: "EXPIRED",
+      });
+
+      return res.status(410).json({
+        message: "Reset OTP has expired",
+      });
+    }
+
+    const incomingHash = hashOtpCode(otp_code);
+
+    if (incomingHash !== latestOtp.code_hash) {
+      return res.status(401).json({
+        message: "Invalid reset OTP",
+      });
+    }
+
+    const newPasswordHash = await bcrypt.hash(new_password, 10);
+    const now = new Date();
+
+    await user.update({
+      password_hash: newPasswordHash,
+    });
+
+    await latestOtp.update({
+      status: "VERIFIED",
+      consumed_at: now,
+    });
+
+    // revoke toàn bộ session cũ để bắt login lại
+    await SessionToken.update(
+      {
+        revoked_at: now,
+      },
+      {
+        where: {
+          user_id: user.user_id,
+          revoked_at: null,
+        },
+      }
+    );
+
+    // vô hiệu các OTP reset pending còn lại
+    await OtpVerification.update(
+      {
+        status: "REPLACED",
+      },
+      {
+        where: {
+          user_id: user.user_id,
+          channel: otpChannelKey,
+          status: "PENDING",
+          consumed_at: null,
+          otp_id: {
+            [Op.ne]: latestOtp.otp_id,
+          },
+        },
+      }
+    );
+
+    return res.status(200).json({
+      message: "Password reset successful. Please log in again.",
     });
   } catch (error) {
     next(error);

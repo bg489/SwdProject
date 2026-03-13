@@ -3,6 +3,7 @@ import UserAccount from "./UserAccount.js";
 import Permission from "./Permission.js";
 import RolePermission from "./RolePermission.js";
 import SessionToken from "./SessionToken.js";
+import OtpVerification from "./OtpVerification.js";
 
 Role.hasMany(UserAccount, {
   foreignKey: "role_id",
@@ -32,10 +33,19 @@ SessionToken.belongsTo(UserAccount, {
   foreignKey: "user_id",
 });
 
+UserAccount.hasMany(OtpVerification, {
+  foreignKey: "user_id",
+});
+
+OtpVerification.belongsTo(UserAccount, {
+  foreignKey: "user_id",
+});
+
 export {
   Role,
   UserAccount,
   Permission,
   RolePermission,
   SessionToken,
+  OtpVerification,
 };
